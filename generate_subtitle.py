@@ -29,11 +29,12 @@ logging.basicConfig(
 
 def clean_text(text):
     return re.sub(r'<\|[^|]*\|>', '', text or "").strip()
- 
+
+
 model_short_names = {
     "funasr": "FunAudioLLM/Fun-ASR-Nano-2512",
     "qwen3": "Qwen/Qwen3-ASR-1.7B",
- }
+}
 
 CHINESE_FILLER_PATTERNS = [
     r"嗯",
@@ -91,7 +92,7 @@ JAPANESE_FILLER_PATTERNS = [
 FILLER_PATTERNS = CHINESE_FILLER_PATTERNS + JAPANESE_FILLER_PATTERNS
 FILLER_ONLY_RE = re.compile(r'^(?:' + '|'.join(FILLER_PATTERNS) + r')+$')
 
-VAD_SPLIT_THRESHOLD_SECONDS = 600
+VAD_SPLIT_THRESHOLD_SECONDS = 300
 VAD_SPLIT_THRESHOLD_MS = VAD_SPLIT_THRESHOLD_SECONDS * 1000
 
 PREPROCESS_SYSTEM_PROMPT = """You are a professional Japanese ASR post-processing assistant.
@@ -203,6 +204,71 @@ TRANSLATION_USER_PROMPT_PREFIX = (
     "Use context across the supplied segments and keep the tone smooth. "
     "Keep the same segment order and return only JSON. "
 )
+HOT_WORDS = [
+    "おまんこ"
+    "まんこ",
+    "クリトリス",
+    "乳首",
+    "おっぱい",
+    "陰部",
+    "割れ目",
+    "アナル",
+    "セックス",
+    "エッチ",
+    "挿入",
+    "キス",
+    "フェラ",
+    "クンニ",
+    "手コキ",
+    "パイズリ",
+    "素股",
+    "愛撫",
+    "射精",
+    "中出し",
+    "外出し",
+    "精液",
+    "ザーメン",
+    "イく",
+    "イク",
+    "絶頂",
+    "潮吹き",
+    "妊娠",
+    "危険日",
+    "排卵日",
+    "赤ちゃん",
+    "孕ませる",
+    "コンドーム",
+    "ゴム",
+    "避妊",
+    "気持ちいい",
+    "感じる",
+    "敏感",
+    "興奮",
+    "発情",
+    "舐める",
+    "しゃぶる",
+    "揉む",
+    "擦る",
+    "押し込む",
+    "締め付ける",
+    "もっと",
+    "奥まで",
+    "深く",
+    "そのまま",
+    "出して",
+    "全部",
+    "飲んで",
+    "撮影",
+    "写真",
+    "動画",
+    "カメラ",
+    "スタッフ",
+    "監督",
+    "本番",
+    "監禁",
+    "拘束",
+    "解放",
+]
 
 
 def is_filler_only(text):
@@ -493,6 +559,7 @@ def build_model_kwargs(args):
         "punc_model": "ct-punc",
         "device": args.device,
         "disable_update": args.disable_update,
+        "hotword": HOT_WORDS,
     }
     if args.spk:
         kwargs["spk_model"] = "cam++"
@@ -514,7 +581,7 @@ def build_generate_kwargs(input_path, args):
         "sentence_timestamp": True,
         "output_timestamp": True,
         "return_time_stamps": True,
-        "merge_vad": True
+        "merge_vad": getattr(args, "merge_vad", False),
     }
     generate_kwargs["language"] = language
     return generate_kwargs
@@ -701,7 +768,8 @@ def probe_audio_duration_ms(input_path):
         "-of", "default=noprint_wrappers=1:nokey=1", input_path,
     ]
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        completed = subprocess.run(
+            command, check=True, capture_output=True, text=True)
         return int(float(completed.stdout.strip()) * 1000)
     except (OSError, subprocess.CalledProcessError, ValueError):
         return None
@@ -746,9 +814,33 @@ def group_vad_intervals(intervals, max_duration_ms=VAD_SPLIT_THRESHOLD_MS):
 def write_audio_chunk(input_path, output_path, start_ms, end_ms):
     command = [
         "ffmpeg", "-y", "-ss", f"{start_ms / 1000:.3f}", "-to", f"{end_ms / 1000:.3f}",
-        "-i", input_path, "-vn", "-ac", "1", "-ar", "16000", output_path,
+        "-i", input_path, "-vn", output_path,
     ]
     subprocess.run(command, check=True, capture_output=True, text=True)
+
+
+def extract_mp4_audio(input_path, output_path):
+    """Extract an MP4's audio as a 16 kHz mono WAV file."""
+    print(f"[Extract] Extracting MP4 audio to WAV: {output_path}")
+    extract_start = time.time()
+    command = [
+        "ffmpeg", "-y", "-i", input_path, "-vn", "-ac", "1", "-ar", "16000", output_path,
+    ]
+    subprocess.run(command, check=True, capture_output=True, text=True)
+    print(f"[Extract] WAV extraction completed in {time.time() - extract_start:.2f}s")
+
+
+@contextmanager
+def prepare_transcription_input(input_path):
+    """Yield an audio path, extracting MP4 audio before subtitle processing when needed."""
+    if os.path.splitext(input_path)[1].lower() != ".mp4":
+        yield input_path
+        return
+
+    with tempfile.TemporaryDirectory(prefix="funasr-input-") as temp_dir:
+        wav_path = os.path.join(temp_dir, "input.wav")
+        extract_mp4_audio(input_path, wav_path)
+        yield wav_path
 
 
 @contextmanager
@@ -756,7 +848,8 @@ def split_long_audio_with_vad(input_path, args):
     """Yield ``(path, original_offset_ms)`` inputs, VAD-splitting media over 600 seconds."""
     duration_ms = probe_audio_duration_ms(input_path)
     if duration_ms is None:
-        print("[VAD] Could not determine input duration; skipping pre-transcription splitting.")
+        print(
+            "[VAD] Could not determine input duration; skipping pre-transcription splitting.")
         yield [(input_path, 0)]
         return
     if duration_ms <= VAD_SPLIT_THRESHOLD_MS:
@@ -772,7 +865,8 @@ def split_long_audio_with_vad(input_path, args):
     vad_start = time.time()
     vad_model = AutoModel(
         model="fsmn-vad", device=args.device, disable_update=args.disable_update)
-    vad_result = vad_model.generate(input=input_path, batch_size_s=300)
+    vad_result = vad_model.generate(
+        input=input_path, batch_size_s=300)
     intervals = extract_vad_intervals(vad_result)
     chunks = group_vad_intervals(intervals)
     print(
@@ -793,7 +887,8 @@ def split_long_audio_with_vad(input_path, args):
                 f"{start_ms / 1000:.3f}s - {end_ms / 1000:.3f}s")
             write_audio_chunk(input_path, chunk_path, start_ms, end_ms)
             chunk_inputs.append((chunk_path, start_ms))
-        print(f"[VAD] Created {len(chunk_inputs)} temporary transcription chunk(s).")
+        print(
+            f"[VAD] Created {len(chunk_inputs)} temporary transcription chunk(s).")
         yield chunk_inputs
     finally:
         if args.keep_vad_chunks:
@@ -813,12 +908,14 @@ def run_transcription(input_path, args):
     print(f"Model loaded in {model_load_duration:.2f}s")
     print("Transcribing...")
     transcribe_start = time.time()
-    chunk_inputs = input_path if isinstance(input_path, list) else [(input_path, 0)]
+    chunk_inputs = input_path if isinstance(
+        input_path, list) else [(input_path, 0)]
     sentence_info = []
     texts = []
     for index, (chunk_path, offset_ms) in enumerate(chunk_inputs, 1):
         if len(chunk_inputs) > 1:
-            print(f"[ASR] Transcribing VAD chunk {index}/{len(chunk_inputs)} (offset: {offset_ms}ms)...")
+            print(
+                f"[ASR] Transcribing VAD chunk {index}/{len(chunk_inputs)} (offset: {offset_ms}ms)...")
         result = model.generate(**build_generate_kwargs(chunk_path, args))
         result_item = result[0]
         texts.append(result_item.get("text", ""))
@@ -826,7 +923,8 @@ def run_transcription(input_path, args):
         if chunk_sentences:
             for sentence in chunk_sentences:
                 adjusted = dict(sentence)
-                adjusted["start"] = int(adjusted.get("start", 0) or 0) + offset_ms
+                adjusted["start"] = int(
+                    adjusted.get("start", 0) or 0) + offset_ms
                 adjusted["end"] = int(adjusted.get("end", 0) or 0) + offset_ms
                 sentence_info.append(adjusted)
         elif result_item.get("text"):
@@ -856,9 +954,9 @@ def write_recognition_output(output_path, segments, args, openai_key, openai_bas
     print_completion(output_path, segments, start_time)
 
 
-def process_input_file(input_path, args, openai_key, openai_base, start_time):
+def process_input_file(input_path, args, openai_key, openai_base, start_time, output_path=None):
     # 处理单个输入文件，覆盖字幕复用、ASR 和可选翻译链路。
-    output_path = args.output or f"{os.path.splitext(input_path)[0]}.{args.format}"
+    output_path = output_path or args.output or f"{os.path.splitext(input_path)[0]}.{args.format}"
     print(f"Input:  {input_path}")
     print(f"Output: {output_path}")
 
@@ -919,6 +1017,9 @@ def main():
                         help="Enable audio preprocessing before ASR")
     parser.add_argument("--keep-vad-chunks", action="store_true",
                         help="Keep VAD-split temporary WAV files instead of deleting them")
+    parser.add_argument(
+        "--merge-vad", action=argparse.BooleanOptionalAction, default=False,
+        help="Merge FunASR VAD segments during ASR generation (default: disabled)")
     args = parser.parse_args()
 
     input_paths = expand_input_paths(args.input)
@@ -938,12 +1039,17 @@ def main():
     if model_short_names.get(args.model):
         args.model = model_short_names[args.model]
 
+    total_start_time = time.time()
     for input_path in input_paths:
         if not os.path.exists(input_path):
             print(f"Error: {input_path} not found")
             sys.exit(1)
-        process_input_file(input_path, args, openai_key,
-                           openai_base, time.time())
+        source_input_path = input_path
+        output_path = args.output or f"{os.path.splitext(source_input_path)[0]}.{args.format}"
+        with prepare_transcription_input(input_path) as prepared_input_path:
+            process_input_file(prepared_input_path, args, openai_key, openai_base,
+                               time.time(), output_path=output_path)
+    print(f"[Total] All inputs completed in {time.time() - total_start_time:.2f}s")
 
 
 if __name__ == "__main__":
