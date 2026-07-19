@@ -56,14 +56,34 @@ CHINESE_FILLER_PATTERNS = [
 ]
 
 JAPANESE_FILLER_PATTERNS = [
-    r"あのね",
+    # 仅保留没有词汇语义的犹豫音、感叹发声与气声。
     r"えっと",
     r"えーと",
     r"えー",
+    r"えぇ",
+    r"えっ",
+    r"え",
     r"あー",
+    r"あぁ",
+    r"あっ",
     r"うーん",
-    r"うん",
+    r"うー",
+    r"うぅ",
     r"んー",
+    r"んっ",
+    r"んん",
+    r"ん",
+    r"おー",
+    r"おっ",
+    r"はぁ",
+    r"はー",
+    r"ふぅ",
+    r"ふー",
+    r"ふふ",
+    r"はは",
+    r"あ",
+    r"あのね",
+    r"うん",
     r"ねえ",
     r"よね",
     r"よ",
@@ -81,16 +101,19 @@ JAPANESE_FILLER_PATTERNS = [
     r"まじ",
     r"ホント",
     r"は",
-    r"はい"
-    r"あ"
-    r"し"
-    r"う"
-    r"ほ"
-    r"ラ"
+    r"はい",
+    r"し",
+    r"う",
+    r"ほ",
+    r"ラ",
 ]
 
 FILLER_PATTERNS = CHINESE_FILLER_PATTERNS + JAPANESE_FILLER_PATTERNS
-FILLER_ONLY_RE = re.compile(r'^(?:' + '|'.join(FILLER_PATTERNS) + r')+$')
+FILLER_ONLY_RE = re.compile(
+    r'^(?:' + '|'.join(
+        re.escape(pattern) for pattern in sorted(FILLER_PATTERNS, key=len, reverse=True)
+    ) + r')+$'
+)
 
 VAD_SPLIT_THRESHOLD_SECONDS = 300
 VAD_SPLIT_THRESHOLD_MS = VAD_SPLIT_THRESHOLD_SECONDS * 1000
@@ -419,10 +442,18 @@ def build_openai_payload(segment_group):
     }
 
 
+def append_user_prompt(user_prompt, additional_instructions):
+    """Append optional CLI instructions without changing the built-in prompt."""
+    if not additional_instructions or not additional_instructions.strip():
+        return user_prompt
+    return f"{user_prompt}\n\nAdditional instructions:\n{additional_instructions.strip()}\n"
+
+
 def process_segments_with_openai(api_key, model, segments, max_context_tokens, *,
                                  openai_base=None, verbose=True, max_retries=3,
                                  action_label="Processing", result_field="text",
                                  system_prompt="", user_prompt_prefix="",
+                                 user_prompt_suffix="", request_overrides=None,
                                  fallback_to_original_text=True, temperature=0):
     # 对字幕分段执行一轮 OpenAI 变换处理。
     api_url = openai_base or "https://api.openai.com/v1/chat/completions"
@@ -443,6 +474,7 @@ def process_segments_with_openai(api_key, model, segments, max_context_tokens, *
         user_prompt = (
             f"{user_prompt_prefix}"
             f"Input: {json.dumps(payload, ensure_ascii=False)}")
+        user_prompt = append_user_prompt(user_prompt, user_prompt_suffix)
 
         request_payload = {
             "model": model,
@@ -452,6 +484,8 @@ def process_segments_with_openai(api_key, model, segments, max_context_tokens, *
             ],
             "temperature": temperature
         }
+        if request_overrides:
+            request_payload.update(request_overrides)
 
         success = False
         last_error = None
@@ -498,7 +532,8 @@ def process_segments_with_openai(api_key, model, segments, max_context_tokens, *
     return processed_segments
 
 
-def preprocess_segments_with_openai(api_key, model, segments, max_context_tokens, openai_base, verbose=True, max_retries=3):
+def preprocess_segments_with_openai(api_key, model, segments, max_context_tokens, openai_base,
+                                    verbose=True, max_retries=3, user_prompt_suffix=""):
     # 在保持分段顺序不变的前提下，先清洗日语 ASR 文本再进入翻译。
     return process_segments_with_openai(
         api_key,
@@ -512,6 +547,7 @@ def preprocess_segments_with_openai(api_key, model, segments, max_context_tokens
         result_field="processed",
         system_prompt=PREPROCESS_SYSTEM_PROMPT,
         user_prompt_prefix="Keep the same segment order and return only JSON. ",
+        user_prompt_suffix=user_prompt_suffix,
         fallback_to_original_text=True,
     )
 
@@ -559,10 +595,13 @@ def build_model_kwargs(args):
         "punc_model": "ct-punc",
         "device": args.device,
         "disable_update": args.disable_update,
-        "hotword": HOT_WORDS,
     }
     if args.spk:
         kwargs["spk_model"] = "cam++"
+        # Qwen3's punctuation tokens can occasionally differ from its timestamp
+        # tokens.  Use VAD-bound speech regions for speaker assignment so FunASR
+        # does not pass incomplete punctuation-derived timestamps to distribute_spk.
+        kwargs["spk_mode"] = "vad_segment"
     if "Fun-ASR-Nano" in args.model or "Qwen" in args.model:
         kwargs["trust_remote_code"] = True
         kwargs["hub"] = "hf"
@@ -582,13 +621,22 @@ def build_generate_kwargs(input_path, args):
         "output_timestamp": True,
         "return_time_stamps": True,
         "merge_vad": getattr(args, "merge_vad", False),
+        "hotword": HOT_WORDS
     }
     generate_kwargs["language"] = language
     return generate_kwargs
 
 
 def build_preprocess_options(args, output_path):
-    return build_default_preprocess_options(args.preprocess_audio, output_path)
+    enable_denoise = getattr(args, "enable_denoise", False)
+    enable_vocal_separation = getattr(args, "enable_vocal_separation", False)
+    options = build_default_preprocess_options(
+        args.preprocess_audio or enable_denoise or enable_vocal_separation,
+        output_path,
+    )
+    options.enable_denoise = enable_denoise
+    options.enable_vocal_separation = enable_vocal_separation
+    return options
 
 
 def build_segments_from_result(result_item, filter_fillers):
@@ -636,7 +684,19 @@ def write_subtitles(output_path, segments, output_format, bilingual, include_spe
                     f"{fmt(seg['start'])} --> {fmt(seg['end'])}\n{text}\n\n")
 
 
-def translate_segments_with_openai(api_key, model, segments, max_context_tokens, openai_base=None, verbose=True, max_retries=3):
+def build_deepseek_thinking_overrides(model, enabled):
+    """Return DeepSeek-only thinking settings for the final translation request."""
+    if enabled and model.lower().startswith("deepseek-"):
+        return {
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
+        }
+    return None
+
+
+def translate_segments_with_openai(api_key, model, segments, max_context_tokens, openai_base=None,
+                                   verbose=True, max_retries=3, user_prompt_suffix="",
+                                   enable_deepseek_thinking=True):
     # 将预处理后的日语字幕分段翻译成简体中文。
     processed_segments = process_segments_with_openai(
         api_key,
@@ -650,6 +710,9 @@ def translate_segments_with_openai(api_key, model, segments, max_context_tokens,
         result_field="translation",
         system_prompt=TRANSLATION_SYSTEM_PROMPT,
         user_prompt_prefix=TRANSLATION_USER_PROMPT_PREFIX,
+        user_prompt_suffix=user_prompt_suffix,
+        request_overrides=build_deepseek_thinking_overrides(
+            model, enable_deepseek_thinking),
         fallback_to_original_text=False,
     )
     return processed_segments
@@ -695,20 +758,25 @@ def run_bilingual_pipeline(segments, args, openai_key, openai_base, output_path,
         openai_base=openai_base,
         verbose=True,
         max_retries=3,
+        user_prompt_suffix=args.preprocess_user_prompt,
     )
     preprocess_duration = time.time() - preprocess_start
     print(f"Preprocessing completed in {preprocess_duration:.2f}s")
 
-    print("Translating segments with OpenAI...")
+    print(
+        f"Translating segments with {args.translation_model}..."
+        f"{' (DeepSeek thinking enabled)' if args.translation_thinking else ''}")
     translation_start = time.time()
     segments = translate_segments_with_openai(
         openai_key,
-        args.openai_model,
+        args.translation_model,
         segments,
         args.max_context_tokens,
         openai_base=openai_base,
         verbose=True,
         max_retries=3,
+        user_prompt_suffix=args.translation_user_prompt,
+        enable_deepseek_thinking=args.translation_thinking,
     )
     translation_duration = time.time() - translation_start
     print(f"Translation completed in {translation_duration:.2f}s")
@@ -820,11 +888,11 @@ def write_audio_chunk(input_path, output_path, start_ms, end_ms):
 
 
 def extract_mp4_audio(input_path, output_path):
-    """Extract an MP4's audio as a 16 kHz mono WAV file."""
+    """Extract an MP4 audio stream to WAV without resampling or channel conversion."""
     print(f"[Extract] Extracting MP4 audio to WAV: {output_path}")
     extract_start = time.time()
     command = [
-        "ffmpeg", "-y", "-i", input_path, "-vn", "-ac", "1", "-ar", "16000", output_path,
+        "ffmpeg", "-y", "-i", input_path, "-vn", output_path,
     ]
     subprocess.run(command, check=True, capture_output=True, text=True)
     print(f"[Extract] WAV extraction completed in {time.time() - extract_start:.2f}s")
@@ -845,30 +913,38 @@ def prepare_transcription_input(input_path):
 
 @contextmanager
 def split_long_audio_with_vad(input_path, args):
-    """Yield ``(path, original_offset_ms)`` inputs, VAD-splitting media over 600 seconds."""
+    """Yield ``(path, original_offset_ms)`` inputs, VAD-splitting media over a configured limit."""
+    if not getattr(args, "long_audio_split", getattr(args, "vad_split_long_audio", True)):
+        print("[VAD] Long-audio pre-splitting is disabled.")
+        yield [(input_path, 0)]
+        return
+
+    threshold_seconds = getattr(
+        args, "vad_split_threshold_seconds", VAD_SPLIT_THRESHOLD_SECONDS)
+    threshold_ms = int(threshold_seconds * 1000)
     duration_ms = probe_audio_duration_ms(input_path)
     if duration_ms is None:
         print(
             "[VAD] Could not determine input duration; skipping pre-transcription splitting.")
         yield [(input_path, 0)]
         return
-    if duration_ms <= VAD_SPLIT_THRESHOLD_MS:
+    if duration_ms <= threshold_ms:
         print(
             f"[VAD] Input duration: {duration_ms / 1000:.1f}s "
-            f"(threshold: {VAD_SPLIT_THRESHOLD_SECONDS}s); no pre-split needed.")
+            f"(threshold: {threshold_seconds:g}s); no pre-split needed.")
         yield [(input_path, 0)]
         return
 
     print(
         f"[VAD] Input duration: {duration_ms / 1000:.1f}s "
-        f"(threshold: {VAD_SPLIT_THRESHOLD_SECONDS}s); running FunASR VAD...")
+        f"(threshold: {threshold_seconds:g}s); running FunASR VAD...")
     vad_start = time.time()
     vad_model = AutoModel(
         model="fsmn-vad", device=args.device, disable_update=args.disable_update)
     vad_result = vad_model.generate(
         input=input_path, batch_size_s=300)
     intervals = extract_vad_intervals(vad_result)
-    chunks = group_vad_intervals(intervals)
+    chunks = group_vad_intervals(intervals, max_duration_ms=threshold_ms)
     print(
         f"[VAD] Detection completed in {time.time() - vad_start:.2f}s: "
         f"{len(intervals)} speech interval(s), grouped into {len(chunks)} chunk(s).")
@@ -891,7 +967,7 @@ def split_long_audio_with_vad(input_path, args):
             f"[VAD] Created {len(chunk_inputs)} temporary transcription chunk(s).")
         yield chunk_inputs
     finally:
-        if args.keep_vad_chunks:
+        if args.keep_long_audio_chunks:
             print(f"[VAD] Keeping temporary transcription chunks: {temp_dir}")
         else:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -996,15 +1072,24 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--disable-update", action="store_true",
                         help="Skip FunASR model update/check when loading the model")
-    parser.add_argument("--spk", action="store_true",
-                        help="Include speaker labels")
+    parser.add_argument("--spk", action=argparse.BooleanOptionalAction, default=True,
+                        help="Include speaker labels (default: enabled)")
     parser.add_argument("--no-filter-fillers", dest="filter_fillers",
                         action="store_false", help="Do not remove filler-only segments")
     parser.add_argument("--openai-key", help="OpenAI API key")
     parser.add_argument(
         "--openai-url", help="OpenAI API base URL, e.g. https://api.gptsapi.net/v1")
     parser.add_argument("--openai-model", default="deepseek-v4-flash",
-                        help="OpenAI model name for translation")
+                        help="Model for subtitle preprocessing")
+    parser.add_argument("--translation-model", default="deepseek-v4-pro",
+                        help="Higher-tier model used only for final translation")
+    parser.add_argument("--preprocess-user-prompt", default="",
+                        help="Extra instructions appended to the preprocessing user prompt")
+    parser.add_argument("--translation-user-prompt", default="",
+                        help="Extra instructions appended to the final translation user prompt")
+    parser.add_argument("--translation-thinking", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Enable DeepSeek thinking mode for final translation (default: disabled)")
     parser.add_argument("--max-context-tokens", type=int, default=512,
                         help="Max context size for OpenAI translation upload")
     parser.add_argument("--bilingual", action="store_true",
@@ -1013,14 +1098,29 @@ def main():
                         help="Force re-recognition even if same-name subtitle file exists")
     parser.add_argument("--force-translation", dest="force_translation", action="store_true",
                         help="Force re-translation of bilingual subtitles even if existing translations are present")
-    parser.add_argument("--preprocess-audio", action="store_true",
-                        help="Enable audio preprocessing before ASR")
+    parser.add_argument("--preprocess-audio", action=argparse.BooleanOptionalAction,
+                        default=True, help="Enable audio preprocessing before ASR (default: enabled)")
+    parser.add_argument("--enable-denoise", "--denoise", dest="enable_denoise",
+                        action="store_true", help="Enable DeepFilterNet2 denoise before ASR")
+    parser.add_argument("--enable-vocal-separation", "--vocal-separation",
+                        dest="enable_vocal_separation", action="store_true",
+                        help="Enable Demucs vocal separation before ASR")
     parser.add_argument("--keep-vad-chunks", action="store_true",
                         help="Keep VAD-split temporary WAV files instead of deleting them")
     parser.add_argument(
-        "--merge-vad", action=argparse.BooleanOptionalAction, default=False,
-        help="Merge FunASR VAD segments during ASR generation (default: disabled)")
+        "--long-audio-split", dest="long_audio_split",
+        action=argparse.BooleanOptionalAction, default=False,
+        help="Split audio longer than the VAD threshold before ASR (default: disabled)")
+    parser.add_argument(
+        "--vad-split-threshold-seconds", type=float,
+        default=VAD_SPLIT_THRESHOLD_SECONDS,
+        help=f"Long-audio VAD split threshold in seconds (default: {VAD_SPLIT_THRESHOLD_SECONDS})")
+    parser.add_argument(
+        "--merge-vad", action=argparse.BooleanOptionalAction, default=True,
+        help="Merge FunASR VAD segments during ASR generation (default: enabled)")
     args = parser.parse_args()
+    if args.vad_split_threshold_seconds <= 0:
+        parser.error("--vad-split-threshold-seconds must be greater than 0")
 
     input_paths = expand_input_paths(args.input)
     if not input_paths:
@@ -1054,5 +1154,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# 待办：1.VAD对Qwen貌似不生效 2.说活人分离 3.Preprocessing chunk 1/1 (88 segments) ... 分chunk似乎也没生效
