@@ -1,0 +1,53 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Python
+__pycache__
+test/__pycache__
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Editor settings
+.vscode/
+
+# Generated subtitle data and API exchange logs
+*.srt
+*.vtt
+*.raw-segments.json
+*.segments.json
+*.openai-exchanges.json
+*.audio_preprocess/
+*.audio_preprocess_test/
+
+# Local input/output media and generated working folders
+out/
+outputs/
+wav/
+test.audio_preprocess/
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.aac
+*.mp4
+*.mkv
+*.avi
+*.mov
+
+# Downloaded models and third-party binaries
+models/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+deepFilter.exe

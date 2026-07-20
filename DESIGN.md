@@ -2,9 +2,9 @@
 
 ## 概览
 
-这个工作区包含一套两阶段字幕处理流水线：
+这个工作区包含一套以 FunASR 为核心的字幕处理流水线：
 
-1. [generate_subtitle.py](generate_subtitle.py) 负责统一编排字幕复用、ASR 转写、基于 OpenAI 的文本清洗、翻译、字幕写出以及分段日志落地。
+1. [generate_subtitle.py](generate_subtitle.py) 负责统一编排 MP4 音频提取、字幕复用、ASR/VAD/说话人转写、基于 OpenAI 的文本清洗、翻译、字幕写出以及日志落地。
 2. [preprocess_audio.py](preprocess_audio.py) 负责在 ASR 前执行可选的音频预处理。
 
 当前设计将编排逻辑和较重的外部依赖调用保留在脚本层，同时把纯文本处理和字幕转换辅助逻辑尽量隔离出来，使其可以在不运行 FunASR 或 OpenAI 的情况下单独测试。
@@ -14,8 +14,9 @@
 ### [generate_subtitle.py](generate_subtitle.py)
 
 - 展开命令行输入路径并校验用户参数。
+- 对 MP4 仅提取音频流为 WAV，不在提取阶段重采样或改变声道数。
 - 在满足条件时复用已有字幕文件，跳过重复识别。
-- 对每个输入文件执行 FunASR 转写。
+- 对每个输入文件执行 FunASR 转写；可选在转写前对长音频运行独立 VAD 分块。
 - 从 ASR 结果构建标准化的字幕分段对象。
 - 在需要时执行两轮 OpenAI 处理：
   - `text -> processed`：用于日语 ASR 结果后处理
@@ -52,17 +53,18 @@
 
 对每一个输入文件，[generate_subtitle.py](generate_subtitle.py) 按以下顺序执行：
 
-1. 解析输出字幕路径。
+1. 解析输出字幕路径；MP4 输入先提取音频到 `<输出名>.audio_preprocess/00_extracted.wav`。
 2. 如果未强制重新识别，则优先尝试复用已有字幕文件。
 3. 按需调用 [preprocess_audio.py](preprocess_audio.py) 对源音频做预处理。
-4. 加载 FunASR 模型并执行转写。
-5. 将 ASR 输出转换为字幕分段字典。
-6. 写出 `raw-segments` JSON，便于调试和审计。
-7. 如果启用了双语模式：
+4. 如果启用了 `--long-audio-split` 且时长超过阈值，用 `fsmn-vad` 生成持久化分块。
+5. 加载 FunASR 模型并执行转写；可选使用 `cam++` 生成说话人标签。
+6. 将 ASR 输出转换为字幕分段字典。
+7. 写出 `raw-segments` JSON，便于调试和审计。
+8. 如果启用了双语模式：
    - 先用 OpenAI 对分段做预处理
    - 再用 OpenAI 对分段做翻译
    - 最后写出最终 `segments` JSON 和双语字幕
-8. 如果未启用双语模式，则直接写出最终 `segments` JSON 和单语字幕。
+9. 如果未启用双语模式，则直接写出最终 `segments` JSON 和单语字幕。
 
 ## OpenAI 处理设计
 
@@ -73,6 +75,7 @@
 - 按请求大小对分段进行分组
 - 构造稳定的 JSON 载荷
 - 调用兼容 OpenAI 的接口
+- 将每次请求 payload 与 API 原始响应写入 `<字幕>.openai-exchanges.json`
 - 从可能夹带额外包装文本的模型响应中提取 JSON
 - 将每个返回分段重新映射回原始顺序
 - 按字段语义应用回退策略
@@ -104,12 +107,16 @@
 
 ## 日志与输出产物
 
-当前流水线主要产出两类文件：
+当前流水线主要产出以下文件：
 
 - 字幕文件：`.srt` 或 `.vtt`
 - JSON 日志：`raw-segments` 和最终 `segments`
+- 双语 API 交换日志：`openai-exchanges.json`
+- 工作目录：`.audio_preprocess`，包含提取 WAV、预处理产物、manifest 和可选 VAD 分块。
 
 JSON 日志的目的，是在不把大块模型输出直接刷到终端的前提下，保留可检查的中间结果。
+
+`.audio_preprocess` 默认仅在本次运行创建时自动清理；指定 `--keep-audio-preprocess` 可保留。运行前已有的目录不会自动删除。
 
 ## 测试策略
 

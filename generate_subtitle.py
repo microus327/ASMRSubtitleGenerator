@@ -5,6 +5,14 @@
 # 示例：
 # python generate_subtitle.py 厉害了.wav --bilingual --openai-url https://api.deepseek.com/chat/completions --openai-key sk-5bfe8de8ce2749f29ac31b0e1c6aaf67 --force-translation --force-recognition --disable-update --spk
 
+import os
+import sys
+if "--offline" in sys.argv:
+    # Must be set before FunASR/Hugging Face are imported, as their offline
+    # configuration is read during module initialization.
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 from preprocess_audio import build_default_preprocess_options, preprocess_audio
 from funasr import AutoModel
 import requests
@@ -13,15 +21,11 @@ import time
 import math
 import json
 import re
-import os
-import sys
 import argparse
 import logging
 import subprocess
-import tempfile
 import shutil
 import wave
-from contextlib import contextmanager
 logging.basicConfig(
     level=logging.INFO,  # 设置日志级别为INFO
 )
@@ -292,7 +296,7 @@ HOT_WORDS = [
     "拘束",
     "解放",
 ]
-
+OPEN_AI_DEFAULT_BASE = "https://api.deepseek.com/chat/completions"
 
 def is_filler_only(text):
     if not text or not text.strip():
@@ -449,14 +453,30 @@ def append_user_prompt(user_prompt, additional_instructions):
     return f"{user_prompt}\n\nAdditional instructions:\n{additional_instructions.strip()}\n"
 
 
+def write_openai_exchange_log(log_path, record):
+    """Append an OpenAI-compatible request/response exchange to a JSON log."""
+    if not log_path:
+        return
+    record = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), **record}
+    try:
+        with open(log_path, "r", encoding="utf-8") as log_file:
+            log_data = json.load(log_file)
+    except (FileNotFoundError, json.JSONDecodeError):
+        log_data = {"exchanges": []}
+    log_data.setdefault("exchanges", []).append(record)
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        json.dump(log_data, log_file, ensure_ascii=False, indent=2)
+
+
 def process_segments_with_openai(api_key, model, segments, max_context_tokens, *,
                                  openai_base=None, verbose=True, max_retries=3,
                                  action_label="Processing", result_field="text",
                                  system_prompt="", user_prompt_prefix="",
                                  user_prompt_suffix="", request_overrides=None,
+                                 exchange_log_path=None,
                                  fallback_to_original_text=True, temperature=0):
     # 对字幕分段执行一轮 OpenAI 变换处理。
-    api_url = openai_base or "https://api.openai.com/v1/chat/completions"
+    api_url = openai_base or OPEN_AI_DEFAULT_BASE
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -493,6 +513,14 @@ def process_segments_with_openai(api_key, model, segments, max_context_tokens, *
             try:
                 response = requests.post(
                     api_url, headers=headers, json=request_payload, timeout=120)
+                write_openai_exchange_log(exchange_log_path, {
+                    "action": action_label,
+                    "chunk": idx,
+                    "attempt": attempt,
+                    "request": request_payload,
+                    "response_status": response.status_code,
+                    "response_raw": response.text,
+                })
                 if response.status_code != 200:
                     raise RuntimeError(
                         f"OpenAI {action_label.lower()} failed: {response.status_code} {response.text}")
@@ -516,6 +544,14 @@ def process_segments_with_openai(api_key, model, segments, max_context_tokens, *
                 break
             except Exception as exc:
                 last_error = exc
+                if not isinstance(exc, RuntimeError):
+                    write_openai_exchange_log(exchange_log_path, {
+                        "action": action_label,
+                        "chunk": idx,
+                        "attempt": attempt,
+                        "request": request_payload,
+                        "error": str(exc),
+                    })
                 if attempt < max_retries:
                     if verbose:
                         print(
@@ -533,7 +569,8 @@ def process_segments_with_openai(api_key, model, segments, max_context_tokens, *
 
 
 def preprocess_segments_with_openai(api_key, model, segments, max_context_tokens, openai_base,
-                                    verbose=True, max_retries=3, user_prompt_suffix=""):
+                                    verbose=True, max_retries=3, user_prompt_suffix="",
+                                    exchange_log_path=None):
     # 在保持分段顺序不变的前提下，先清洗日语 ASR 文本再进入翻译。
     return process_segments_with_openai(
         api_key,
@@ -548,6 +585,7 @@ def preprocess_segments_with_openai(api_key, model, segments, max_context_tokens
         system_prompt=PREPROCESS_SYSTEM_PROMPT,
         user_prompt_prefix="Keep the same segment order and return only JSON. ",
         user_prompt_suffix=user_prompt_suffix,
+        exchange_log_path=exchange_log_path,
         fallback_to_original_text=True,
     )
 
@@ -605,8 +643,8 @@ def build_model_kwargs(args):
     if "Fun-ASR-Nano" in args.model or "Qwen" in args.model:
         kwargs["trust_remote_code"] = True
         kwargs["hub"] = "hf"
-    # if "Qwen3" in args.model:
-    #     kwargs["forced_aligner"] = "Qwen/Qwen3-ForcedAligner-0.6B"
+    if "Qwen3" in args.model and args.forced_aligner:
+        kwargs["forced_aligner"] = "Qwen/Qwen3-ForcedAligner-0.6B"
     return kwargs
 
 
@@ -617,9 +655,8 @@ def build_generate_kwargs(input_path, args):
         "input": input_path,
         "batch_size": 1,
         "batch_size_s": 300,
-        "sentence_timestamp": True,
-        "output_timestamp": True,
-        "return_time_stamps": True,
+        "sentence_timestamp": getattr(args, "spk", False),
+        "output_timestamp": getattr(args, "spk", False),
         "merge_vad": getattr(args, "merge_vad", False),
         "hotword": HOT_WORDS
     }
@@ -636,6 +673,7 @@ def build_preprocess_options(args, output_path):
     )
     options.enable_denoise = enable_denoise
     options.enable_vocal_separation = enable_vocal_separation
+    options.write_manifest = args.local_log
     return options
 
 
@@ -696,7 +734,7 @@ def build_deepseek_thinking_overrides(model, enabled):
 
 def translate_segments_with_openai(api_key, model, segments, max_context_tokens, openai_base=None,
                                    verbose=True, max_retries=3, user_prompt_suffix="",
-                                   enable_deepseek_thinking=True):
+                                   enable_deepseek_thinking=True, exchange_log_path=None):
     # 将预处理后的日语字幕分段翻译成简体中文。
     processed_segments = process_segments_with_openai(
         api_key,
@@ -713,6 +751,7 @@ def translate_segments_with_openai(api_key, model, segments, max_context_tokens,
         user_prompt_suffix=user_prompt_suffix,
         request_overrides=build_deepseek_thinking_overrides(
             model, enable_deepseek_thinking),
+        exchange_log_path=exchange_log_path,
         fallback_to_original_text=False,
     )
     return processed_segments
@@ -731,7 +770,9 @@ def write_bilingual_srt(output_path, segments, fmt, output_format, include_speak
                 f"{i}\n{fmt(seg['start'])} --> {fmt(seg['end'])}\n{source_text}\n{target_text}\n\n")
 
 
-def write_segments_log(output_path, segments, stage="segments"):
+def write_segments_log(output_path, segments, stage="segments", enabled=True):
+    if not enabled:
+        return
     log_path = f"{output_path}.{stage}.json"
     with open(log_path, "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
@@ -748,17 +789,26 @@ def print_completion(output_path, segments, start_time=None):
 
 def run_bilingual_pipeline(segments, args, openai_key, openai_base, output_path, start_time):
     # 执行双语链路：先预处理文本，再翻译，最后写出双语字幕。
+    exchange_log_path = (
+        f"{output_path}.openai-exchanges.json"
+        if args.local_log else None
+    )
+    if exchange_log_path:
+        print(f"OpenAI request/response log: {exchange_log_path}")
+    else:
+        print("OpenAI request/response log is disabled.")
     print("Preprocessing segments with OpenAI before translation...")
     preprocess_start = time.time()
     segments = preprocess_segments_with_openai(
         openai_key,
-        args.openai_model,
+        args.preprocess_model,
         segments,
         args.max_context_tokens,
         openai_base=openai_base,
         verbose=True,
         max_retries=3,
         user_prompt_suffix=args.preprocess_user_prompt,
+        exchange_log_path=exchange_log_path,
     )
     preprocess_duration = time.time() - preprocess_start
     print(f"Preprocessing completed in {preprocess_duration:.2f}s")
@@ -777,11 +827,12 @@ def run_bilingual_pipeline(segments, args, openai_key, openai_base, output_path,
         max_retries=3,
         user_prompt_suffix=args.translation_user_prompt,
         enable_deepseek_thinking=args.translation_thinking,
+        exchange_log_path=exchange_log_path,
     )
     translation_duration = time.time() - translation_start
     print(f"Translation completed in {translation_duration:.2f}s")
 
-    write_segments_log(output_path, segments)
+    write_segments_log(output_path, segments, enabled=args.local_log)
     write_subtitles(output_path, segments, args.format,
                     args.bilingual, include_speaker=args.spk)
     print_completion(output_path, segments, start_time)
@@ -898,26 +949,22 @@ def extract_mp4_audio(input_path, output_path):
     print(f"[Extract] WAV extraction completed in {time.time() - extract_start:.2f}s")
 
 
-@contextmanager
-def prepare_transcription_input(input_path):
-    """Yield an audio path, extracting MP4 audio before subtitle processing when needed."""
+def prepare_transcription_input(input_path, work_dir):
+    """Return an audio path, extracting MP4 audio into the processing directory when needed."""
     if os.path.splitext(input_path)[1].lower() != ".mp4":
-        yield input_path
-        return
+        return input_path
 
-    with tempfile.TemporaryDirectory(prefix="funasr-input-") as temp_dir:
-        wav_path = os.path.join(temp_dir, "input.wav")
-        extract_mp4_audio(input_path, wav_path)
-        yield wav_path
+    os.makedirs(work_dir, exist_ok=True)
+    wav_path = os.path.join(work_dir, "00_extracted.wav")
+    extract_mp4_audio(input_path, wav_path)
+    return wav_path
 
 
-@contextmanager
-def split_long_audio_with_vad(input_path, args):
-    """Yield ``(path, original_offset_ms)`` inputs, VAD-splitting media over a configured limit."""
+def split_long_audio_with_vad(input_path, args, work_dir):
+    """Return ``(path, original_offset_ms)`` inputs, splitting into persistent VAD chunks when needed."""
     if not getattr(args, "long_audio_split", getattr(args, "vad_split_long_audio", True)):
         print("[VAD] Long-audio pre-splitting is disabled.")
-        yield [(input_path, 0)]
-        return
+        return [(input_path, 0)]
 
     threshold_seconds = getattr(
         args, "vad_split_threshold_seconds", VAD_SPLIT_THRESHOLD_SECONDS)
@@ -926,14 +973,12 @@ def split_long_audio_with_vad(input_path, args):
     if duration_ms is None:
         print(
             "[VAD] Could not determine input duration; skipping pre-transcription splitting.")
-        yield [(input_path, 0)]
-        return
+        return [(input_path, 0)]
     if duration_ms <= threshold_ms:
         print(
             f"[VAD] Input duration: {duration_ms / 1000:.1f}s "
             f"(threshold: {threshold_seconds:g}s); no pre-split needed.")
-        yield [(input_path, 0)]
-        return
+        return [(input_path, 0)]
 
     print(
         f"[VAD] Input duration: {duration_ms / 1000:.1f}s "
@@ -950,27 +995,20 @@ def split_long_audio_with_vad(input_path, args):
         f"{len(intervals)} speech interval(s), grouped into {len(chunks)} chunk(s).")
     if not chunks:
         print("[VAD] No speech segments found; transcribing the original input.")
-        yield [(input_path, 0)]
-        return
+        return [(input_path, 0)]
 
-    temp_dir = tempfile.mkdtemp(prefix="funasr-vad-")
-    try:
-        chunk_inputs = []
-        for index, (start_ms, end_ms) in enumerate(chunks, 1):
-            chunk_path = os.path.join(temp_dir, f"part_{index:04d}.wav")
-            print(
-                f"[VAD] Exporting chunk {index}/{len(chunks)}: "
-                f"{start_ms / 1000:.3f}s - {end_ms / 1000:.3f}s")
-            write_audio_chunk(input_path, chunk_path, start_ms, end_ms)
-            chunk_inputs.append((chunk_path, start_ms))
+    chunk_dir = os.path.join(work_dir, "vad_chunks")
+    os.makedirs(chunk_dir, exist_ok=True)
+    chunk_inputs = []
+    for index, (start_ms, end_ms) in enumerate(chunks, 1):
+        chunk_path = os.path.join(chunk_dir, f"part_{index:04d}.wav")
         print(
-            f"[VAD] Created {len(chunk_inputs)} temporary transcription chunk(s).")
-        yield chunk_inputs
-    finally:
-        if args.keep_long_audio_chunks:
-            print(f"[VAD] Keeping temporary transcription chunks: {temp_dir}")
-        else:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            f"[VAD] Exporting chunk {index}/{len(chunks)}: "
+            f"{start_ms / 1000:.3f}s - {end_ms / 1000:.3f}s")
+        write_audio_chunk(input_path, chunk_path, start_ms, end_ms)
+        chunk_inputs.append((chunk_path, start_ms))
+    print(f"[VAD] Created {len(chunk_inputs)} transcription chunk(s): {chunk_dir}")
+    return chunk_inputs
 
 
 def run_transcription(input_path, args):
@@ -1017,14 +1055,16 @@ def run_transcription(input_path, args):
 
 def write_recognition_output(output_path, segments, args, openai_key, openai_base, start_time):
     # 将识别结果写入日志和最终字幕文件。
-    write_segments_log(output_path, segments, stage="raw-segments")
+    write_segments_log(output_path, segments, stage="raw-segments",
+                       enabled=args.local_log)
 
     if args.bilingual:
         run_bilingual_pipeline(segments, args, openai_key,
                                openai_base, output_path, start_time)
         return
 
-    write_segments_log(output_path, segments, stage="segments")
+    write_segments_log(output_path, segments, stage="segments",
+                       enabled=args.local_log)
     write_subtitles(output_path, segments, args.format,
                     args.bilingual, include_speaker=args.spk)
     print_completion(output_path, segments, start_time)
@@ -1049,8 +1089,9 @@ def process_input_file(input_path, args, openai_key, openai_base, start_time, ou
         print(f"Audio preprocessing completed in {preprocess_duration:.2f}s")
         print(f"Preprocessed audio: {effective_input_path}")
 
-    with split_long_audio_with_vad(effective_input_path, args) as transcription_inputs:
-        result_item = run_transcription(transcription_inputs, args)
+    transcription_inputs = split_long_audio_with_vad(
+        effective_input_path, args, preprocess_options.work_dir)
+    result_item = run_transcription(transcription_inputs, args)
     segments = build_segments_from_result(result_item, args.filter_fillers)
     if not segments:
         print("No speech detected.")
@@ -1072,14 +1113,19 @@ def main():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--disable-update", action="store_true",
                         help="Skip FunASR model update/check when loading the model")
+    parser.add_argument("--offline", action="store_true",
+                        help="Use only locally cached Hugging Face model files")
     parser.add_argument("--spk", action=argparse.BooleanOptionalAction, default=True,
                         help="Include speaker labels (default: enabled)")
+    parser.add_argument("--forced-aligner", action=argparse.BooleanOptionalAction,
+                        default=False,
+                        help="Enable Qwen3 forced alignment (default: disabled)")
     parser.add_argument("--no-filter-fillers", dest="filter_fillers",
                         action="store_false", help="Do not remove filler-only segments")
     parser.add_argument("--openai-key", help="OpenAI API key")
     parser.add_argument(
-        "--openai-url", help="OpenAI API base URL, e.g. https://api.gptsapi.net/v1")
-    parser.add_argument("--openai-model", default="deepseek-v4-flash",
+        "--openai-url", help="OpenAI API base URL")
+    parser.add_argument("--preprocess-model", default="deepseek-v4-flash",
                         help="Model for subtitle preprocessing")
     parser.add_argument("--translation-model", default="deepseek-v4-pro",
                         help="Higher-tier model used only for final translation")
@@ -1094,6 +1140,9 @@ def main():
                         help="Max context size for OpenAI translation upload")
     parser.add_argument("--bilingual", action="store_true",
                         help="Write bilingual subtitles with Japanese above Chinese")
+    parser.add_argument("--local-log", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Write all local JSON logs (default: enabled)")
     parser.add_argument("--force", "--force-recognition", dest="force_recognition", action="store_true",
                         help="Force re-recognition even if same-name subtitle file exists")
     parser.add_argument("--force-translation", dest="force_translation", action="store_true",
@@ -1105,8 +1154,8 @@ def main():
     parser.add_argument("--enable-vocal-separation", "--vocal-separation",
                         dest="enable_vocal_separation", action="store_true",
                         help="Enable Demucs vocal separation before ASR")
-    parser.add_argument("--keep-vad-chunks", action="store_true",
-                        help="Keep VAD-split temporary WAV files instead of deleting them")
+    parser.add_argument("--keep-audio-preprocess", action="store_true",
+                        help="Keep the generated .audio_preprocess directory after completion")
     parser.add_argument(
         "--long-audio-split", dest="long_audio_split",
         action=argparse.BooleanOptionalAction, default=False,
@@ -1121,6 +1170,8 @@ def main():
     args = parser.parse_args()
     if args.vad_split_threshold_seconds <= 0:
         parser.error("--vad-split-threshold-seconds must be greater than 0")
+    if args.offline:
+        print("[Model] Offline mode enabled; using locally cached Hugging Face files only.")
 
     input_paths = expand_input_paths(args.input)
     if not input_paths:
@@ -1146,9 +1197,20 @@ def main():
             sys.exit(1)
         source_input_path = input_path
         output_path = args.output or f"{os.path.splitext(source_input_path)[0]}.{args.format}"
-        with prepare_transcription_input(input_path) as prepared_input_path:
+        work_dir = f"{os.path.splitext(output_path)[0]}.audio_preprocess"
+        work_dir_existed = os.path.isdir(work_dir)
+        try:
+            prepared_input_path = prepare_transcription_input(input_path, work_dir)
             process_input_file(prepared_input_path, args, openai_key, openai_base,
                                time.time(), output_path=output_path)
+        finally:
+            if args.keep_audio_preprocess:
+                print(f"[AudioPreprocess] Keeping intermediate files: {work_dir}")
+            elif not work_dir_existed and os.path.isdir(work_dir):
+                print(f"[AudioPreprocess] Removing intermediate files: {work_dir}")
+                shutil.rmtree(work_dir)
+            elif work_dir_existed:
+                print(f"[AudioPreprocess] Preserving existing directory: {work_dir}")
     print(f"[Total] All inputs completed in {time.time() - total_start_time:.2f}s")
 
 

@@ -35,6 +35,7 @@ class PreprocessOptions:
     peak_target_db: float = -1.0
     loudness_target_lufs: float = -16.0
     keep_intermediate: bool = True
+    write_manifest: bool = True
     sample_rate: int = 16000
     channels: int = 1
 
@@ -398,7 +399,8 @@ def preprocess_audio(input_path, options: PreprocessOptions):
         current_pipeline_step += 1
 
     manifest["final_output"] = str(current_path)
-    _write_manifest(work_dir, manifest)
+    if options.write_manifest:
+        _write_manifest(work_dir, manifest)
 
     # for path in intermediate_paths:
     #     print(f"[AudioPreprocess] Intermediate output: {path}")

@@ -3,6 +3,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +70,33 @@ class GenerateSubtitleTests(unittest.TestCase):
             max_duration_ms=600000,
         )
         self.assertEqual(groups, [(0, 590000), (610000, 700000)])
+
+    def test_prepare_transcription_input_extracts_mp4_audio(self):
+        with mock.patch.object(subtitle_module.os, "makedirs") as make_dirs:
+            with mock.patch.object(subtitle_module, "extract_mp4_audio") as extract:
+                prepared_path = subtitle_module.prepare_transcription_input(
+                    "video.MP4", "video.audio_preprocess")
+                self.assertEqual(prepared_path, "video.audio_preprocess\\00_extracted.wav")
+                make_dirs.assert_called_once_with("video.audio_preprocess", exist_ok=True)
+                extract.assert_called_once_with("video.MP4", prepared_path)
+
+    def test_append_user_prompt_keeps_and_appends_instructions(self):
+        prompt = subtitle_module.append_user_prompt("Input: {}", "保留专有名词")
+        self.assertIn("Input: {}", prompt)
+        self.assertIn("Additional instructions:\n保留专有名词", prompt)
+
+    def test_deepseek_thinking_is_only_added_for_deepseek_model(self):
+        self.assertEqual(
+            subtitle_module.build_deepseek_thinking_overrides("deepseek-v4-pro", True),
+            {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
+        )
+        self.assertIsNone(
+            subtitle_module.build_deepseek_thinking_overrides("gpt-5", True))
+
+    def test_japanese_filler_patterns_match_individual_short_fillers(self):
+        for filler in ("あ", "えー。", "えっと", "うーん", "んっ", "はぁ", "ふふ"):
+            with self.subTest(filler=filler):
+                self.assertTrue(subtitle_module.is_filler_only(filler))
 
 
 if __name__ == "__main__":
