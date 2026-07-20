@@ -3,8 +3,7 @@
 # 用于从音频或视频生成 SRT/VTT 字幕。
 #
 # 示例：
-# python generate_subtitle.py 厉害了.wav --bilingual --openai-url https://api.deepseek.com/chat/completions --openai-key sk-5bfe8de8ce2749f29ac31b0e1c6aaf67 --force-translation --force-recognition --disable-update --spk
-
+# python generate_subtitle.py "audio.wav"  --bilingual --openai-url https://api.deepseek.com/chat/completions --openai-key "YOUR OPENAI KEY" --force --disable-update --offline --long-audio-split
 import os
 import sys
 if "--offline" in sys.argv:
@@ -1141,7 +1140,7 @@ def main():
     parser.add_argument("--bilingual", action="store_true",
                         help="Write bilingual subtitles with Japanese above Chinese")
     parser.add_argument("--local-log", action=argparse.BooleanOptionalAction,
-                        default=True,
+                        default=False,
                         help="Write all local JSON logs (default: enabled)")
     parser.add_argument("--force", "--force-recognition", dest="force_recognition", action="store_true",
                         help="Force re-recognition even if same-name subtitle file exists")
